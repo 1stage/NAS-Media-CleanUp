@@ -78,12 +78,69 @@ def get_target_folder(base_dir, year, is_photo):
     folder_name = f"{year:04d} - {label}"
     return os.path.join(base_dir, folder_name)
 
+def find_existing_duplicate(filepath, is_photo):
+    """Check if file already exists in any year folder without EXIF extraction."""
+    filename = os.path.basename(filepath)
+    
+    # Check common years (2020-2025) and 0000 folder first
+    common_years = [2025, 2024, 2023, 2022, 2021, 2020, 0]
+    target_base = PHOTO_DIR if is_photo else VIDEO_DIR
+    
+    for year in common_years:
+        target_dir = get_target_folder(target_base, year, is_photo)
+        target_path = os.path.join(target_dir, filename)
+        if os.path.exists(target_path):
+            if is_fast_duplicate(filepath, target_path):
+                return target_path
+    
+    return None
+
+def is_fast_duplicate(src_path, dst_path):
+    """Fast duplicate detection using size and modification time only - no binary comparison."""
+    try:
+        # Check file sizes first (instant)
+        src_size = os.path.getsize(src_path)
+        dst_size = os.path.getsize(dst_path)
+        if src_size != dst_size:
+            return False
+        
+        # Check modification times (instant)
+        src_mtime = os.path.getmtime(src_path)
+        dst_mtime = os.path.getmtime(dst_path)
+        
+        # Allow for small time differences due to file system precision
+        time_diff = abs(src_mtime - dst_mtime)
+        if time_diff > 2.0:  # More than 2 seconds difference
+            return False
+        
+        # If size and time match, consider it a duplicate without binary comparison
+        return True
+        
+    except Exception as e:
+        log(f"[ERROR] Failed to compare file metadata: {e}")
+        summary["errors"] += 1
+        return False
+
 def is_binary_duplicate(src_path, dst_path):
+    """Full binary duplicate detection - only use when fast method is inconclusive."""
     try:
         if os.path.getsize(src_path) != os.path.getsize(dst_path):
             return False
-        with open(src_path, "rb") as f1, open(dst_path, "rb") as f2:
-            return f1.read() == f2.read()
+        
+        # Explicit file handling with forced close
+        f1 = open(src_path, "rb")
+        f2 = open(dst_path, "rb")
+        try:
+            result = f1.read() == f2.read()
+        finally:
+            f1.close()
+            f2.close()
+        
+        # Longer delay to allow network file handles to release
+        import time
+        time.sleep(2.0)
+        
+        return result
     except Exception as e:
         log(f"[ERROR] Failed to compare files: {e}")
         summary["errors"] += 1
@@ -98,6 +155,24 @@ def organize_file(filepath, dry_run=False, report=False, delete_duplicates=False
         return
 
     is_photo = kind.mime.startswith("image")
+    
+    # CHECK FOR DUPLICATES FIRST - before any EXIF extraction!
+    existing_duplicate = find_existing_duplicate(filepath, is_photo)
+    if existing_duplicate:
+        log(f"[DUPLICATE] Fast match found (size + time): {filepath} == {existing_duplicate}")
+        if delete_duplicates and not dry_run:
+            try:
+                os.remove(filepath)
+                log(f"[REMOVED] Source file deleted: {filepath}")
+                summary["duplicates"] += 1
+            except Exception as e:
+                log(f"[ERROR] Failed to delete duplicate source: {e}")
+                summary["errors"] += 1
+        else:
+            summary["duplicates"] += 1
+        return
+    
+    # Only extract EXIF data if file is NOT a duplicate
     year = get_creation_year(filepath)
     if not year:
         year = 0  # Use 0000 for undated files
@@ -109,8 +184,9 @@ def organize_file(filepath, dry_run=False, report=False, delete_duplicates=False
     filename = os.path.basename(filepath)
     target_path = os.path.join(target_dir, filename)
     if os.path.exists(target_path):
-        if is_binary_duplicate(filepath, target_path):
-            log(f"[DUPLICATE] Binary match found: {filepath} == {target_path}")
+        # This should rarely happen now since we checked common years above
+        if is_fast_duplicate(filepath, target_path):
+            log(f"[DUPLICATE] Fast match found (size + time): {filepath} == {target_path}")
             if delete_duplicates and not dry_run:
                 try:
                     os.remove(filepath)
