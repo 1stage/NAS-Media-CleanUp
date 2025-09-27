@@ -1,10 +1,12 @@
 """
 organize_by_year.py
-Version 0.10 (Pre-release) — Created by Sean P. Harrington with assistance from Microsoft Copilot  
-Date: Friday, 26 September 2025, 10:00 AM PDT
+Version 0.11 (Pre-release) — Created by Sean P. Harrington with assistance from Microsoft Copilot  
+Date: Friday, 26 September 2025, 4:30 PM PDT
 
 Organizes photos and videos from one or more upload directories into year-based folders
 based on their metadata creation date. Designed for use with a NAS setup.
+
+Enhanced with improved file locking handling and retry mechanisms.
 
 Usage:
     python organize_by_year.py [--dry-run] [--report] [--limit N] [--delete-duplicates]
@@ -22,6 +24,7 @@ import shutil
 import filetype
 import argparse
 import configparser
+import time
 from hachoir.parser import createParser
 from hachoir.metadata import extractMetadata
 from datetime import datetime
@@ -49,51 +52,90 @@ report_entries = []
 summary = {
     "processed": 0,
     "moved": 0,
-    "locked": 0,
     "duplicates": 0,
+    "locked": 0,
     "errors": 0
 }
 
-def get_creation_year(filepath):
-    try:
-        parser = createParser(filepath)
-        if not parser:
-            return None
-        metadata = extractMetadata(parser)
-        if metadata and metadata.has("creation_date"):
-            return metadata.get("creation_date").year
-    except Exception as e:
-        log(f"[ERROR] Failed to extract metadata from {filepath}: {e}")
-        summary["errors"] += 1
-    return None
-
 def log(message):
-    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
-    entry = f"{timestamp} {message}"
-    log_entries.append(entry)
-    print(entry)
+    print(message)
+    log_entries.append(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
 
-def get_target_folder(base_dir, year, is_photo):
-    label = "Photos" if is_photo else "Videos"
-    folder_name = f"{year:04d} - {label}"
-    return os.path.join(base_dir, folder_name)
+# === FILE OPERATION HELPERS WITH RETRY LOGIC ===
 
-def find_existing_duplicate(filepath, is_photo):
-    """Check if file already exists in any year folder without EXIF extraction."""
-    filename = os.path.basename(filepath)
+def move_file_with_retry(source_path, target_path, filename, target_dir, max_retries=3, delay=1.0):
+    """Move file with retry logic to handle temporary locks."""
+    for attempt in range(max_retries + 1):
+        try:
+            if attempt > 0:
+                # Progressive delay: 1s, 2s, 4s
+                wait_time = delay * (2 ** (attempt - 1))
+                log(f"[RETRY {attempt}] Waiting {wait_time:.1f}s before retry: {filename}")
+                time.sleep(wait_time)
+            
+            log(f"[MOVE] {filename} → {target_dir}")
+            shutil.move(source_path, target_path)
+            
+            if attempt > 0:
+                log(f"[SUCCESS] File moved after {attempt} retries: {filename}")
+            
+            return True
+            
+        except PermissionError as e:
+            if attempt < max_retries:
+                log(f"[LOCKED] File in use, will retry ({attempt + 1}/{max_retries}): {filename}")
+            else:
+                log(f"[SKIP] File locked after {max_retries} retries: {filename}")
+                return False
+        except Exception as e:
+            log(f"[ERROR] Unexpected error moving {filename}: {str(e)}")
+            return False
     
-    # Check common years (2020-2025) and 0000 folder first
-    common_years = [2025, 2024, 2023, 2022, 2021, 2020, 0]
-    target_base = PHOTO_DIR if is_photo else VIDEO_DIR
+    return False
+
+def delete_file_with_retry(filepath, max_retries=3, delay=0.5):
+    """Delete file with retry logic to handle temporary locks."""
+    for attempt in range(max_retries + 1):
+        try:
+            if attempt > 0:
+                # Brief delay for file handles to close
+                wait_time = delay * attempt
+                log(f"[RETRY DELETE {attempt}] Waiting {wait_time:.1f}s: {os.path.basename(filepath)}")
+                time.sleep(wait_time)
+            
+            os.remove(filepath)
+            log(f"[REMOVED] Source file deleted: {filepath}")
+            
+            if attempt > 0:
+                log(f"[SUCCESS] File deleted after {attempt} retries: {os.path.basename(filepath)}")
+            
+            return True
+            
+        except PermissionError:
+            if attempt < max_retries:
+                log(f"[LOCKED DELETE] File in use, will retry ({attempt + 1}/{max_retries}): {os.path.basename(filepath)}")
+            else:
+                log(f"[SKIP DELETE] File locked after {max_retries} retries: {filepath}")
+                return False
+        except Exception as e:
+            log(f"[ERROR] Unexpected error deleting {filepath}: {str(e)}")
+            return False
     
-    for year in common_years:
-        target_dir = get_target_folder(target_base, year, is_photo)
-        target_path = os.path.join(target_dir, filename)
-        if os.path.exists(target_path):
-            if is_fast_duplicate(filepath, target_path):
-                return target_path
-    
-    return None
+    return False
+
+def wait_for_file_unlock(filepath, max_wait=5.0, check_interval=0.5):
+    """Wait for a file to become unlocked, with timeout."""
+    start_time = time.time()
+    while time.time() - start_time < max_wait:
+        try:
+            # Try to open file in write mode to check if it's locked
+            with open(filepath, 'r+b'):
+                return True
+        except (PermissionError, IOError):
+            time.sleep(check_interval)
+    return False
+
+# === DUPLICATE DETECTION ===
 
 def is_fast_duplicate(src_path, dst_path):
     """Fast duplicate detection using size and modification time only - no binary comparison."""
@@ -117,56 +159,145 @@ def is_fast_duplicate(src_path, dst_path):
         return True
         
     except Exception as e:
-        log(f"[ERROR] Failed to compare file metadata: {e}")
-        summary["errors"] += 1
+        log(f"[ERROR] Fast duplicate check failed for {src_path}: {e}")
         return False
 
-def is_binary_duplicate(src_path, dst_path):
-    """Full binary duplicate detection - only use when fast method is inconclusive."""
+def is_binary_duplicate(file1, file2):
+    """Binary comparison as fallback - only used when fast detection fails."""
     try:
-        if os.path.getsize(src_path) != os.path.getsize(dst_path):
-            return False
-        
-        # Explicit file handling with forced close
-        f1 = open(src_path, "rb")
-        f2 = open(dst_path, "rb")
-        try:
-            result = f1.read() == f2.read()
-        finally:
-            f1.close()
-            f2.close()
-        
-        # Longer delay to allow network file handles to release
-        import time
-        time.sleep(2.0)
-        
-        return result
+        with open(file1, 'rb') as f1, open(file2, 'rb') as f2:
+            while True:
+                chunk1 = f1.read(8192)
+                chunk2 = f2.read(8192)
+                if chunk1 != chunk2:
+                    return False
+                if not chunk1:  # End of file
+                    return True
     except Exception as e:
-        log(f"[ERROR] Failed to compare files: {e}")
-        summary["errors"] += 1
+        log(f"[ERROR] Binary comparison failed: {e}")
         return False
 
-def organize_file(filepath, dry_run=False, report=False, delete_duplicates=False):
+def find_existing_duplicate(source_file, is_photo):
+    """Check common target year folders for duplicates before processing."""
+    filename = os.path.basename(source_file)
+    target_base = PHOTO_DIR if is_photo else VIDEO_DIR
+    
+    # Check most common years first (2020-2025, then 0000 for undated)
+    common_years = [2025, 2024, 2023, 2022, 2021, 2020, 0]
+    
+    for year in common_years:
+        target_dir = get_target_folder(target_base, year, is_photo)
+        if not os.path.exists(target_dir):
+            continue
+            
+        potential_path = os.path.join(target_dir, filename)
+        if os.path.exists(potential_path):
+            if is_fast_duplicate(source_file, potential_path):
+                return potential_path
+    
+    return None
+
+# === METADATA EXTRACTION ===
+
+def get_creation_year(filepath):
+    """Extract creation year from file metadata."""
+    try:
+        parser = createParser(filepath)
+        if not parser:
+            return None
+        
+        with parser:
+            metadata = extractMetadata(parser)
+            if not metadata:
+                return None
+            
+            creation_date = metadata.get('creation_date')
+            if creation_date:
+                if hasattr(creation_date, 'year'):
+                    return creation_date.year
+                elif isinstance(creation_date, str):
+                    # Try to parse various string formats
+                    for fmt in ['%Y:%m:%d %H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d']:
+                        try:
+                            parsed_date = datetime.strptime(creation_date, fmt)
+                            return parsed_date.year
+                        except ValueError:
+                            continue
+                    
+                    # Extract year from string if possible
+                    if len(creation_date) >= 4 and creation_date[:4].isdigit():
+                        return int(creation_date[:4])
+    
+    except Exception as e:
+        log(f"[WARN] Metadata extraction failed for {filepath}: {e}")
+    
+    return None
+
+def get_target_folder(base_dir, year, is_photo):
+    """Generate target folder path."""
+    if year == 0:
+        folder_name = "0000 - Photos" if is_photo else "0000 - Videos"
+    else:
+        folder_name = f"{year} - Photos" if is_photo else f"{year} - Videos"
+    return os.path.join(base_dir, folder_name)
+
+def get_unique_filename(target_dir, filename):
+    """Generate a unique filename if collision exists."""
+    base_path = os.path.join(target_dir, filename)
+    if not os.path.exists(base_path):
+        return filename, base_path
+    
+    name, ext = os.path.splitext(filename)
+    counter = 1
+    
+    while True:
+        new_filename = f"{name}_copy{counter}{ext}"
+        new_path = os.path.join(target_dir, new_filename)
+        if not os.path.exists(new_path):
+            return new_filename, new_path
+        counter += 1
+
+# === MAIN PROCESSING FUNCTION ===
+
+def organize_file(filepath, dry_run=False, delete_duplicates=False, report=False, handle_collisions=False):
+    """Process a single file with enhanced locking handling."""
     summary["processed"] += 1
-    kind = filetype.guess(filepath)
-    if not kind:
-        log(f"[SKIP] Unknown file type: {filepath}")
+    
+    # Determine file type
+    try:
+        kind = filetype.guess(filepath)
+        if not kind:
+            # Fallback to file extension for common formats
+            ext = os.path.splitext(filepath)[1].lower()
+            photo_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp', '.heic', '.heif'}
+            video_extensions = {'.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg'}
+            
+            if ext in photo_extensions:
+                is_photo = True
+                log(f"[FALLBACK] Detected as photo by extension: {filepath}")
+            elif ext in video_extensions:
+                is_photo = False
+                log(f"[FALLBACK] Detected as video by extension: {filepath}")
+            else:
+                log(f"[SKIP] Unknown file type: {filepath}")
+                summary["errors"] += 1
+                return
+        else:
+            is_photo = kind.mime.startswith('image/')
+        
+    except Exception as e:
+        log(f"[ERROR] File type detection failed for {filepath}: {e}")
         summary["errors"] += 1
         return
-
-    is_photo = kind.mime.startswith("image")
     
     # CHECK FOR DUPLICATES FIRST - before any EXIF extraction!
     existing_duplicate = find_existing_duplicate(filepath, is_photo)
     if existing_duplicate:
         log(f"[DUPLICATE] Fast match found (size + time): {filepath} == {existing_duplicate}")
         if delete_duplicates and not dry_run:
-            try:
-                os.remove(filepath)
-                log(f"[REMOVED] Source file deleted: {filepath}")
+            if delete_file_with_retry(filepath):
                 summary["duplicates"] += 1
-            except Exception as e:
-                log(f"[ERROR] Failed to delete duplicate source: {e}")
+            else:
                 summary["errors"] += 1
         else:
             summary["duplicates"] += 1
@@ -188,35 +319,38 @@ def organize_file(filepath, dry_run=False, report=False, delete_duplicates=False
         if is_fast_duplicate(filepath, target_path):
             log(f"[DUPLICATE] Fast match found (size + time): {filepath} == {target_path}")
             if delete_duplicates and not dry_run:
-                try:
-                    os.remove(filepath)
-                    log(f"[REMOVED] Source file deleted: {filepath}")
+                if delete_file_with_retry(filepath):
                     summary["duplicates"] += 1
-                except Exception as e:
-                    log(f"[ERROR] Failed to delete duplicate source: {e}")
+                else:
                     summary["errors"] += 1
             else:
                 summary["duplicates"] += 1
             return
         else:
-            log(f"[SKIP] Filename collision, but content differs: {target_path}")
-            summary["duplicates"] += 1
-            return
+            if handle_collisions:
+                # Generate unique filename for collision
+                new_filename, target_path = get_unique_filename(target_dir, filename)
+                log(f"[COLLISION] Renaming due to collision: {filename} → {new_filename}")
+                filename = new_filename
+            else:
+                log(f"[SKIP] Filename collision, but content differs: {target_path}")
+                summary["duplicates"] += 1
+                return
 
     if dry_run:
         log(f"[DRY-RUN] Would move {filename} → {target_dir}")
     else:
-        try:
-            log(f"[MOVE] {filename} → {target_dir}")
-            shutil.move(filepath, target_path)
+        success = move_file_with_retry(filepath, target_path, filename, target_dir)
+        if success:
             summary["moved"] += 1
-        except PermissionError:
-            log(f"[SKIP] Locked file (in use): {filepath}")
+        else:
             summary["locked"] += 1
             return
 
     if report:
         report_entries.append(f"{filename} → {target_dir}")
+
+# === REPORTING FUNCTIONS ===
 
 def write_logs():
     with open(LOG_PATH, "a", encoding="utf-8") as log_file:
@@ -239,6 +373,8 @@ def write_report():
         report_file.write(f"Duplicate files skipped or removed: {summary['duplicates']} / {summary['processed']}, {pct(summary['duplicates'])}\n")
         report_file.write(f"Unknown type or metadata errors: {summary['errors']} / {summary['processed']}, {pct(summary['errors'])}\n")
 
+# === MAIN FUNCTION ===
+
 def main():
     parser = argparse.ArgumentParser(
         description="Organize NAS media by year based on metadata.",
@@ -248,34 +384,61 @@ def main():
     parser.add_argument("--report", action="store_true", help="Generate a summary report of moved files.")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of files to process (useful for testing).")
     parser.add_argument("--delete-duplicates", action="store_true", help="Delete source file if binary duplicate exists in target.")
+    parser.add_argument("--handle-collisions", action="store_true", help="Rename files when filename collisions occur instead of skipping them.")
+    
     args = parser.parse_args()
-
-    try:
-        for upload_dir in UPLOAD_DIRS:
-            for root, _, files in os.walk(upload_dir):
-                folder_name = os.path.basename(root)
-                if folder_name.isdigit() and len(folder_name) == 4:
-                    continue  # Skip year-based subfolders
-                for file in files:
-                    if args.limit is not None and summary["processed"] >= args.limit:
-                        log(f"[LIMIT] Reached file limit of {args.limit}. Stopping.")
-                        write_logs()
-                        if args.report:
-                            write_report()
-                        return
-                    filepath = os.path.join(root, file)
-                    organize_file(
-                        filepath,
-                        dry_run=args.dry_run,
-                        report=args.report,
-                        delete_duplicates=args.delete_duplicates
-                    )
-    except KeyboardInterrupt:
-        log("[INTERRUPTED] Script stopped by user.")
-
+    
+    log("="*50)
+    log("NAS Media Organization Script v0.11")
+    log("="*50)
+    
+    if args.dry_run:
+        log("[DRY RUN MODE] No files will be moved or deleted.")
+    if args.delete_duplicates:
+        log("[DELETE DUPLICATES] Source files will be removed if duplicates exist.")
+    if args.limit:
+        log(f"[LIMIT] Processing only {args.limit} files.")
+    
+    processed_count = 0
+    
+    for upload_dir in UPLOAD_DIRS:
+        if not os.path.exists(upload_dir):
+            log(f"[SKIP] Upload directory not found: {upload_dir}")
+            continue
+        
+        log(f"[SCAN] Processing directory: {upload_dir}")
+        
+        for root, dirs, files in os.walk(upload_dir):
+            for file in files:
+                if args.limit and processed_count >= args.limit:
+                    log(f"[LIMIT] Reached file limit of {args.limit}. Stopping.")
+                    break
+                
+                filepath = os.path.join(root, file)
+                organize_file(filepath, args.dry_run, args.delete_duplicates, args.report, args.handle_collisions)
+                processed_count += 1
+            
+            if args.limit and processed_count >= args.limit:
+                break
+        
+        if args.limit and processed_count >= args.limit:
+            break
+    
+    # Write logs and report
     write_logs()
     if args.report:
         write_report()
+        log(f"[REPORT] Summary written to: {REPORT_PATH}")
+    
+    log(f"[LOG] Full log written to: {LOG_PATH}")
+    log("="*50)
+    log("PROCESSING COMPLETE")
+    log("="*50)
+    log(f"Files processed: {summary['processed']}")
+    log(f"Files moved: {summary['moved']}")
+    log(f"Duplicates handled: {summary['duplicates']}")
+    log(f"Files locked/skipped: {summary['locked']}")
+    log(f"Errors: {summary['errors']}")
 
 if __name__ == "__main__":
     main()
