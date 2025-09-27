@@ -45,6 +45,15 @@ def log(message):
     print(message)
     log_entries.append(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
 
+def is_system_file(filepath):
+    """Check if file is a Synology system file that should be skipped."""
+    filename = os.path.basename(filepath)
+    return (filename.startswith('.') or 
+            filename.startswith('@') or 
+            '@SynoEAStream' in filepath or 
+            '@eaDir' in filepath or
+            filename == 'Thumbs.db')
+
 # === FILE TYPE DETECTION (Built-in) ===
 def is_photo_file(filepath):
     """Simple file type detection based on extension."""
@@ -225,16 +234,7 @@ def organize_file(filepath, dry_run=False, delete_duplicates=False, report=False
     """Process a single file."""
     summary["processed"] += 1
     
-    # Skip Synology system files and directories
-    filename = os.path.basename(filepath)
-    if (filename.startswith('.') or 
-        filename.startswith('@') or 
-        '@SynoEAStream' in filepath or 
-        '@eaDir' in filepath or
-        filename == 'Thumbs.db'):
-        log(f"[SKIP] System file: {filepath}")
-        summary["processed"] -= 1  # Don't count system files
-        return
+
     
     # Determine file type
     if is_photo_file(filepath):
@@ -364,11 +364,17 @@ def main():
         
         for root, dirs, files in os.walk(upload_dir):
             for file in files:
+                filepath = os.path.join(root, file)
+                
+                # Skip system files before counting them
+                if is_system_file(filepath):
+                    log(f"[SKIP] System file: {filepath}")
+                    continue
+                
                 if args.limit and processed_count >= args.limit:
                     log(f"[LIMIT] Reached file limit of {args.limit}. Stopping.")
                     break
                 
-                filepath = os.path.join(root, file)
                 organize_file(filepath, args.dry_run, args.delete_duplicates, args.report, args.handle_collisions)
                 processed_count += 1
             
