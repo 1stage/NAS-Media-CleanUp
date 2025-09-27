@@ -51,6 +51,12 @@ try:
 except ImportError:
     HAS_OPENCV = False
 
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
 # Duplicate detection result structure
 DuplicateGroup = namedtuple('DuplicateGroup', ['method', 'similarity', 'files', 'recommended_action'])
 FileInfo = namedtuple('FileInfo', ['path', 'size', 'mtime', 'hash_md5', 'hash_sha256'])
@@ -83,8 +89,15 @@ class DuplicateDetector:
         
     def log(self, message, level="INFO"):
         """Enhanced logging with timestamps."""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{timestamp}] [{level}] {message}")
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        if level == "ERROR":
+            print(f"🚨 [{timestamp}] {message}")
+        elif level == "WARNING":
+            print(f"⚠️  [{timestamp}] {message}")
+        elif level == "INFO":
+            print(f"ℹ️  [{timestamp}] {message}")
+        else:
+            print(f"[{timestamp}] [{level}] {message}")
         
     def get_file_hash(self, filepath, algorithm='md5', chunk_size=8192):
         """Calculate file hash with progress tracking for large files."""
@@ -130,70 +143,101 @@ class DuplicateDetector:
             
     def find_exact_duplicates(self, filepaths):
         """Find exact duplicates using file size and hash comparison."""
-        self.log("Finding exact duplicates...")
+        self.log("🔍 Finding exact duplicates...")
         
         # Group by size first (fast pre-filter)
+        self.log(f"📊 Analyzing {len(filepaths)} files by size...")
         size_groups = defaultdict(list)
         for filepath in filepaths:
             info = self.get_file_info(filepath)
             if info and info.size > 0:  # Skip empty files
                 size_groups[info.size].append(filepath)
                 
+        # Count potential duplicates
+        potential_dupes = sum(len(files) for files in size_groups.values() if len(files) > 1)
+        if potential_dupes == 0:
+            self.log("✅ No files with matching sizes found - no exact duplicates possible")
+            return []
+            
+        self.log(f"🎯 Found {potential_dupes} files with matching sizes, calculating hashes...")
         exact_duplicates = []
         
-        # Check files with same size
-        for size, files in size_groups.items():
-            if len(files) < 2:
-                continue
-                
-            self.log(f"Checking {len(files)} files of size {size} bytes...")
+        # Progress tracking for hash calculation
+        files_to_hash = [files for files in size_groups.values() if len(files) > 1]
+        total_hash_files = sum(len(files) for files in files_to_hash)
+        
+        if HAS_TQDM and total_hash_files > 10:
+            pbar = tqdm(total=total_hash_files, desc="Hashing files", unit="files")
+        else:
+            pbar = None
             
-            # Group by hash
-            hash_groups = defaultdict(list)
-            for filepath in files:
-                file_hash = self.get_file_hash(filepath, 'md5')
-                if file_hash:
-                    hash_groups[file_hash].append(filepath)
+        try:
+            # Check files with same size
+            for size, files in size_groups.items():
+                if len(files) < 2:
+                    continue
                     
-            # Find duplicate groups
-            for file_hash, duplicate_files in hash_groups.items():
-                if len(duplicate_files) > 1:
-                    # Verify with SHA256 for security
-                    sha256_groups = defaultdict(list)
-                    for filepath in duplicate_files:
-                        sha256_hash = self.get_file_hash(filepath, 'sha256')
-                        if sha256_hash:
-                            sha256_groups[sha256_hash].append(filepath)
-                            
-                    for sha256_hash, verified_files in sha256_groups.items():
-                        if len(verified_files) > 1:
-                            group = DuplicateGroup(
-                                method='exact',
-                                similarity=1.0,
-                                files=verified_files,
-                                recommended_action=self._recommend_action(verified_files)
-                            )
-                            exact_duplicates.append(group)
-                            self.stats['exact_duplicates'] += len(verified_files) - 1
-                            
+                # Group by hash
+                hash_groups = defaultdict(list)
+                for filepath in files:
+                    file_hash = self.get_file_hash(filepath, 'md5')
+                    if file_hash:
+                        hash_groups[file_hash].append(filepath)
+                    if pbar:
+                        pbar.update(1)
+                        
+                # Find duplicate groups
+                for file_hash, duplicate_files in hash_groups.items():
+                    if len(duplicate_files) > 1:
+                        # Verify with SHA256 for security
+                        sha256_groups = defaultdict(list)
+                        for filepath in duplicate_files:
+                            sha256_hash = self.get_file_hash(filepath, 'sha256')
+                            if sha256_hash:
+                                sha256_groups[sha256_hash].append(filepath)
+                                
+                        for sha256_hash, verified_files in sha256_groups.items():
+                            if len(verified_files) > 1:
+                                group = DuplicateGroup(
+                                    method='exact',
+                                    similarity=1.0,
+                                    files=verified_files,
+                                    recommended_action=self._recommend_action(verified_files)
+                                )
+                                exact_duplicates.append(group)
+                                self.stats['exact_duplicates'] += len(verified_files) - 1
+                                self.log(f"🔍 Found exact duplicate group: {len(verified_files)} identical files")
+        finally:
+            if pbar:
+                pbar.close()
+                                
         return exact_duplicates
         
     def find_near_duplicates(self, filepaths):
         """Find near-duplicates using perceptual hashing (requires PIL)."""
         if not self.enable_near_duplicates:
-            self.log("Near-duplicate detection disabled (PIL not available)")
+            self.log("⚠️  Near-duplicate detection disabled (PIL not available)")
             return []
             
-        self.log("Finding near-duplicates using perceptual hashing...")
+        self.log("🖼️  Finding near-duplicates using perceptual hashing...")
         
         # Filter to image files only
         image_files = [f for f in filepaths if self._is_image_file(f)]
         if len(image_files) < 2:
+            self.log("ℹ️  Not enough image files for near-duplicate detection")
             return []
             
-        # Calculate perceptual hashes
+        self.log(f"📸 Processing {len(image_files)} image files...")
+        
+        # Calculate perceptual hashes with progress tracking
         hash_data = {}
-        for filepath in image_files:
+        if HAS_TQDM and len(image_files) > 20:
+            image_iter = tqdm(image_files, desc="Calculating perceptual hashes", unit="images")
+        else:
+            image_iter = image_files
+            
+        processed = 0
+        for filepath in image_iter:
             try:
                 with Image.open(filepath) as img:
                     # Use multiple hash algorithms for better accuracy
@@ -206,9 +250,12 @@ class DuplicateDetector:
                         'dhash': dhash,
                         'whash': whash
                     }
+                    processed += 1
             except Exception as e:
-                self.log(f"Error processing image {filepath}: {e}", "WARNING")
+                self.log(f"Error processing image {os.path.basename(filepath)}: {e}", "WARNING")
                 continue
+                
+        self.log(f"✅ Successfully processed {processed} images for comparison")
                 
         # Compare hashes to find similar images
         near_duplicates = []

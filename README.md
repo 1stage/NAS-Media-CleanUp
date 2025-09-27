@@ -1,6 +1,23 @@
 # NAS Media Organization v1.0
 
-Professional-grade media organization tools for automatic photo and video management. Designed for both Windows and NAS environments with enterprise-level reliability and features.
+Professional-grade media or### Duplicate Detection (Optional)
+For duplicate detection features:
+
+```bash
+pip install -r requirements-duplicate-detection.txt
+```
+
+**Core Dependencies (always required):**
+- Python 3.7+ with standard library (hashlib, os, pathlib, etc.)
+
+**Enhanced Dependencies (recommended):**
+- `Pillow>=9.0.0` - Image processing for perceptual hashing
+- `imagehash>=4.2.0` - Near-duplicate detection algorithms
+- `tqdm>=4.60.0` - Progress bars for better user experience
+- `opencv-python>=4.5.0` - Advanced image comparison (optional)
+- `scikit-image>=0.19.0` - Structural similarity metrics (optional)
+
+**Note:** The duplicate detection script gracefully degrades functionality if packages aren't available (exact duplicates only without near-duplicate detection).for automatic photo and video management. Designed for both Windows and NAS environments with enterprise-level reliability and features.
 
 ## Overview
 
@@ -22,12 +39,13 @@ This project contains scripts to help organize media files on a NAS (Network Att
 - **Scheduled Automation**: Wrapper script for automated, self-updating runs
 
 ### Duplicate Detection
-- **Advanced Duplicate Detection**: Multiple algorithms for finding exact and near-duplicates
+- **Interactive Analysis**: Designed for laptop-based analysis of NAS media collections
+- **Multiple Detection Algorithms**: Exact duplicates and perceptual near-duplicates
 - **Exact Duplicate Detection**: Binary-identical file detection using MD5/SHA256 hashing
 - **Near-Duplicate Detection**: Perceptual hashing for similar images (requires PIL/imagehash)
 - **Advanced Image Comparison**: OpenCV-based structural similarity (optional)
 - **Smart Recommendations**: Intelligent suggestions for which files to keep
-- **NAS-Optimized Version**: Lightweight duplicate detection without external dependencies
+- **Progress Tracking**: Interactive progress bars and status updates
 - **Space Analysis**: Calculate wasted storage space from duplicates
 - **Multiple Output Formats**: Text reports and JSON export for further processing
 
@@ -41,10 +59,8 @@ This project contains scripts to help organize media files on a NAS (Network Att
 - `oby.cfg` - Configuration file for paths and settings
 
 ### Duplicate Detection Scripts  
-- `detect_duplicates.py` - Advanced duplicate detection with multiple algorithms
-- `detect_duplicates_nas.py` - Lightweight NAS-optimized duplicate detection
-- `run_duplicate_detection.sh` - Wrapper script for scheduled duplicate detection
-- `requirements-duplicates.txt` - Python dependencies for enhanced duplicate detection
+- `detect_duplicates.py` - Interactive duplicate detection for laptop/desktop use
+- `requirements-duplicate-detection.txt` - Python dependencies for duplicate detection
 
 ### Output Directories
 - `logs/` - Directory for operation logs
@@ -120,40 +136,22 @@ python test_unc_access.py
 
 ### Duplicate Detection
 
-#### Advanced Duplicate Detection (Full Version)
+#### Duplicate Detection (Interactive - Run from Laptop)
 ```bash
 # Basic duplicate detection with report
-python detect_duplicates.py /path/to/photos --report duplicates.txt
+python detect_duplicates.py \\NAS-MEDIA\photo\Sorted --report duplicates.txt
 
-# Find 90% similar images with JSON output
-python detect_duplicates.py /path/to/photos --similarity 0.9 --json results.json
+# Find 90% similar images with JSON output  
+python detect_duplicates.py \\NAS-MEDIA\photo\Sorted --similarity 0.9 --json-output results.json
 
-# Multiple directories, exact duplicates only
-python detect_duplicates.py /path1 /path2 --no-near-duplicates --report
+# Multiple directories, exact duplicates only (faster)
+python detect_duplicates.py \\NAS-MEDIA\photo \\NAS-MEDIA\video --no-near-duplicates --report
 
-# Preview mode (safe)
-python detect_duplicates.py /path/to/photos --dry-run
-```
+# Preview mode (safe - no actions taken)
+python detect_duplicates.py \\NAS-MEDIA\photo --dry-run
 
-#### NAS-Optimized Duplicate Detection
-```bash
-# Lightweight detection for NAS
-python3 detect_duplicates_nas.py /volume1/photo --report duplicates.txt
-
-# Multiple directories with JSON output
-python3 detect_duplicates_nas.py /volume1/photo /volume2/backup --json results.json
-
-# Non-recursive scan with progress updates
-python3 detect_duplicates_nas.py /volume1/photo --no-recursive --progress 500
-```
-
-#### Scheduled Duplicate Detection
-```bash
-# Manual execution with auto-update
-./run_duplicate_detection.sh /volume1/photo
-
-# With custom options
-./run_duplicate_detection.sh /volume1/video --json /tmp/results.json
+# Batch processing - scan specific year folders
+python detect_duplicates.py "\\NAS-MEDIA\photo\Sorted\2023 - Photos" "\\NAS-MEDIA\photo\Sorted\2024 - Photos"
 ```
 
 ### File Organization Command Line Options
@@ -166,20 +164,13 @@ python3 detect_duplicates_nas.py /volume1/photo --no-recursive --progress 500
 
 ### Duplicate Detection Command Line Options
 
-#### Advanced Version (`detect_duplicates.py`)
+#### Duplicate Detection (`detect_duplicates.py`)
 - `--similarity N` - Similarity threshold for near-duplicates (0.0-1.0, default: 0.95)
-- `--no-near-duplicates` - Disable near-duplicate detection (faster)
+- `--no-near-duplicates` - Disable near-duplicate detection (faster, exact only)
 - `--no-recursive` - Don't scan subdirectories
 - `--report FILE` - Save detailed report to file
 - `--dry-run` - Preview mode - no actions taken
 - `--json-output FILE` - Save results as JSON file
-
-#### NAS Version (`detect_duplicates_nas.py`)
-- `--no-recursive` - Don't scan subdirectories
-- `--report FILE` - Save detailed report to file
-- `--json FILE` - Save results as JSON file
-- `--progress N` - Show progress every N files (default: 100)
-- `--chunk-size N` - File reading chunk size in bytes (default: 8192)
 
 ## How It Works
 
