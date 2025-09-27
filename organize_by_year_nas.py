@@ -225,6 +225,17 @@ def organize_file(filepath, dry_run=False, delete_duplicates=False, report=False
     """Process a single file."""
     summary["processed"] += 1
     
+    # Skip Synology system files and directories
+    filename = os.path.basename(filepath)
+    if (filename.startswith('.') or 
+        filename.startswith('@') or 
+        '@SynoEAStream' in filepath or 
+        '@eaDir' in filepath or
+        filename == 'Thumbs.db'):
+        log(f"[SKIP] System file: {filepath}")
+        summary["processed"] -= 1  # Don't count system files
+        return
+    
     # Determine file type
     if is_photo_file(filepath):
         is_photo = True
