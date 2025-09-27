@@ -208,7 +208,7 @@ def get_unique_filename(target_dir, filename):
         counter += 1
 
 def remove_empty_directories(root_dir, dry_run=False):
-    """Remove empty directories within root_dir."""
+    """Remove empty directories within root_dir, including system directories."""
     removed_dirs = []
     
     for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
@@ -216,11 +216,29 @@ def remove_empty_directories(root_dir, dry_run=False):
             continue
             
         try:
-            if not filenames and not dirnames:
+            # Check if directory is empty or contains only system files
+            non_system_files = [f for f in filenames if not is_system_file(os.path.join(dirpath, f))]
+            non_system_dirs = [d for d in dirnames if not d.startswith('@')]
+            
+            if not non_system_files and not non_system_dirs:
                 if dry_run:
                     log(f"[DRY-RUN] Would remove empty directory: {dirpath}")
                     removed_dirs.append(dirpath)
                 else:
+                    # Remove any remaining system files first
+                    for f in filenames:
+                        try:
+                            os.remove(os.path.join(dirpath, f))
+                        except:
+                            pass
+                    # Remove any system subdirectories
+                    for d in dirnames:
+                        try:
+                            import shutil
+                            shutil.rmtree(os.path.join(dirpath, d))
+                        except:
+                            pass
+                    # Now remove the directory itself
                     os.rmdir(dirpath)
                     log(f"[CLEANUP] Removed empty directory: {dirpath}")
                     removed_dirs.append(dirpath)
