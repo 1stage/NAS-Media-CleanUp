@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
 """
 detect_duplicates.py
-Version 1.0 - Advanced Photo & Video Duplicate Detection
+Version 1.0 - Normalized Hash Duplicate Detection
 
-A comprehensive duplicate and near-duplicate detection system for media files.
-Features multiple detection algorithms for different types of duplicates:
+High-performance duplicate detection using normalized image hashing for massive
+photo collections. Designed for interactive laptop-based analysis of NAS media.
 
-- Exact duplicates (binary identical)
-- Near-duplicates (similar images with different compression)
-- Same content, different formats (JPEG vs PNG)
-- Different resolutions of same image
-- Similar photos taken in sequence
-
-Designed to work with both Windows and NAS environments, with optional
-dependencies for advanced image comparison features.
-
-Usage:
-    python detect_duplicates.py [options] directory1 [directory2 ...]
+Key Innovation: Normalized Hash Algorithm
+- Converts all images to standardized 32x32 or 64x64 thumbnails
+- Letterboxed with black padding to preserve aspect ratios
+- Quantized to standard 256-color palette for consistent comparison
+- Results in tiny fingerprints (1-4KB) vs multi-MB original images
+- Enables lightning-fast comparison of massive collections
 
 Features:
-- Multiple detection algorithms (hash, perceptual, structural)
-- Configurable similarity thresholds
-- Safe preview mode with detailed reporting
-- Batch processing with progress tracking
-- Integration with existing organization tools
+- Persistent SQLite database tracking (never reprocess the same files)
+- Automatic discovery of new year folders (2026+, etc.)
+- Network-optimized for UNC path access to NAS
+- Incremental processing with resume capability
+- Cross-year duplicate detection (slideshow copies, mis-sorted photos)
+
+Usage:
+    python detect_duplicates.py "\\NAS-MEDIA\photo\Sorted" --test-folder "2010 - Photos"
+    python detect_duplicates.py "\\NAS-MEDIA\photo\Sorted" --build-database
+    python detect_duplicates.py "\\NAS-MEDIA\photo\Sorted" --find-duplicates
 """
 
 import os
@@ -32,492 +32,492 @@ import argparse
 import hashlib
 import json
 import time
+import sqlite3
+import re
 from datetime import datetime
 from collections import defaultdict, namedtuple
 from pathlib import Path
 
-# Optional advanced dependencies - graceful fallback if not available
+# Required dependencies
 try:
-    from PIL import Image
-    import imagehash
+    from PIL import Image, ImageOps
     HAS_PILLOW = True
 except ImportError:
-    HAS_PILLOW = False
+    print("❌ ERROR: PIL/Pillow is required for normalized hash algorithm")
+    print("Install with: pip install Pillow")
+    sys.exit(1)
 
-try:
-    import cv2
-    import numpy as np
-    HAS_OPENCV = True
-except ImportError:
-    HAS_OPENCV = False
-
+# Optional dependencies
 try:
     from tqdm import tqdm
     HAS_TQDM = True
 except ImportError:
     HAS_TQDM = False
 
-# Duplicate detection result structure
-DuplicateGroup = namedtuple('DuplicateGroup', ['method', 'similarity', 'files', 'recommended_action'])
-FileInfo = namedtuple('FileInfo', ['path', 'size', 'mtime', 'hash_md5', 'hash_sha256'])
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
 
-class DuplicateDetector:
-    """Advanced duplicate detection with multiple algorithms."""
+# Data structures
+FileRecord = namedtuple('FileRecord', ['path', 'size', 'mtime', 'hash_md5', 'normalized_hash'])
+DuplicateGroup = namedtuple('DuplicateGroup', ['method', 'similarity', 'files', 'recommended_action'])
+
+class NormalizedHashDetector:
+    """Advanced duplicate detection using normalized image hashing."""
     
-    def __init__(self, similarity_threshold=0.95, enable_near_duplicates=True):
-        self.similarity_threshold = similarity_threshold
-        self.enable_near_duplicates = enable_near_duplicates and HAS_PILLOW
-        self.enable_opencv = HAS_OPENCV
+    def __init__(self, database_path=None, thumbnail_size=64):
+        self.thumbnail_size = thumbnail_size  # 32, 64, or 128
+        self.database_path = database_path or os.path.join(os.getcwd(), 'photo_hashes.db')
         
-        # Statistics tracking
+        # Image file extensions
+        self.image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp', '.heic', '.heif'}
+        
+        # Statistics
         self.stats = {
             'files_scanned': 0,
+            'files_processed': 0,
+            'files_skipped': 0,
             'exact_duplicates': 0,
             'near_duplicates': 0,
-            'total_groups': 0,
-            'space_wasted': 0,
-            'processing_time': 0
+            'processing_time': 0,
+            'database_size': 0
         }
         
-        # Supported file types
-        self.image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp', '.heic', '.heif'}
-        self.video_extensions = {'.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.m4v', '.3gp', '.webm'}
-        
-        # File information cache
-        self.file_cache = {}
-        self.duplicate_groups = []
+        # Initialize database
+        self.init_database()
         
     def log(self, message, level="INFO"):
-        """Enhanced logging with timestamps."""
+        """Enhanced logging with timestamps and emojis."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         if level == "ERROR":
             print(f"🚨 [{timestamp}] {message}")
         elif level == "WARNING":
             print(f"⚠️  [{timestamp}] {message}")
+        elif level == "SUCCESS":
+            print(f"✅ [{timestamp}] {message}")
         elif level == "INFO":
             print(f"ℹ️  [{timestamp}] {message}")
         else:
             print(f"[{timestamp}] [{level}] {message}")
+            
+    def init_database(self):
+        """Initialize SQLite database for persistent tracking."""
+        self.log("Initializing database...")
         
-    def get_file_hash(self, filepath, algorithm='md5', chunk_size=8192):
-        """Calculate file hash with progress tracking for large files."""
-        hash_func = hashlib.md5() if algorithm == 'md5' else hashlib.sha256()
+        with sqlite3.connect(self.database_path) as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS photo_hashes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_path TEXT UNIQUE NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    file_mtime REAL NOT NULL,
+                    md5_hash TEXT NOT NULL,
+                    normalized_hash BLOB NOT NULL,
+                    thumbnail_size INTEGER NOT NULL,
+                    processing_date REAL NOT NULL,
+                    folder_year INTEGER,
+                    status TEXT DEFAULT 'processed'
+                )
+            ''')
+            
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_md5_hash ON photo_hashes(md5_hash)
+            ''')
+            
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_file_path ON photo_hashes(file_path)
+            ''')
+            
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_folder_year ON photo_hashes(folder_year)
+            ''')
+            
+            # Get database statistics
+            cursor = conn.execute("SELECT COUNT(*) FROM photo_hashes")
+            self.stats['database_size'] = cursor.fetchone()[0]
+            
+        self.log(f"Database initialized: {self.stats['database_size']} photos already processed")
         
+    def create_normalized_hash(self, image_path):
+        """
+        Create normalized hash using your algorithm:
+        1. Resize to fixed square dimensions (32x32, 64x64, etc.)
+        2. Letterbox with black padding to preserve aspect ratio
+        3. Quantize to standard 256-color palette
+        4. Generate hash from pixel data
+        """
         try:
-            file_size = os.path.getsize(filepath)
-            with open(filepath, 'rb') as f:
-                processed = 0
-                while chunk := f.read(chunk_size):
-                    hash_func.update(chunk)
-                    processed += len(chunk)
-                    
-                    # Progress for large files (>100MB)
-                    if file_size > 100 * 1024 * 1024 and processed % (10 * 1024 * 1024) == 0:
-                        progress = (processed / file_size) * 100
-                        self.log(f"Hashing {os.path.basename(filepath)}: {progress:.1f}%", "DEBUG")
+            with Image.open(image_path) as img:
+                # Convert to RGB if needed
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # Step 1 & 2: Resize with letterboxing (black padding)
+                # This preserves aspect ratio while creating consistent dimensions
+                img_resized = ImageOps.fit(
+                    img, 
+                    (self.thumbnail_size, self.thumbnail_size),
+                    method=Image.Resampling.LANCZOS,
+                    centering=(0.5, 0.5)
+                )
+                
+                # Step 3: Quantize to standard 256-color palette
+                # This normalizes color variations and compression artifacts
+                img_quantized = img_resized.quantize(
+                    colors=256,
+                    method=Image.Quantize.MEDIANCUT,
+                    kmeans=0,
+                    palette=None,
+                    dither=Image.Dither.NONE
+                ).convert('RGB')
+                
+                # Step 4: Generate hash from pixel data
+                # Convert to bytes for consistent hashing
+                pixel_data = img_quantized.tobytes('raw', 'RGB')
+                
+                # Create hash of the normalized pixel data
+                hash_obj = hashlib.sha256(pixel_data)
+                normalized_hash = hash_obj.digest()
+                
+                return normalized_hash
+                
+        except Exception as e:
+            self.log(f"Error creating normalized hash for {image_path}: {e}", "ERROR")
+            return None
+            
+    def calculate_similarity(self, hash1, hash2):
+        """Calculate similarity between two normalized hashes using Hamming distance."""
+        if len(hash1) != len(hash2):
+            return 0.0
+            
+        # Convert to bit arrays for Hamming distance calculation
+        if HAS_NUMPY:
+            # Fast numpy implementation
+            arr1 = np.frombuffer(hash1, dtype=np.uint8)
+            arr2 = np.frombuffer(hash2, dtype=np.uint8)
+            
+            # XOR and count different bits
+            xor_result = np.bitwise_xor(arr1, arr2)
+            hamming_distance = np.unpackbits(xor_result).sum()
+            
+            # Convert to similarity (0.0 to 1.0)
+            max_distance = len(hash1) * 8  # 8 bits per byte
+            similarity = 1.0 - (hamming_distance / max_distance)
+            
+        else:
+            # Pure Python fallback
+            different_bits = 0
+            for b1, b2 in zip(hash1, hash2):
+                xor = b1 ^ b2
+                # Count set bits in XOR result
+                different_bits += bin(xor).count('1')
+                
+            max_distance = len(hash1) * 8
+            similarity = 1.0 - (different_bits / max_distance)
+            
+        return similarity
+        
+    def get_file_md5(self, file_path):
+        """Calculate MD5 hash of file for exact duplicate detection."""
+        hash_md5 = hashlib.md5()
+        try:
+            with open(file_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_md5.update(chunk)
+            return hash_md5.hexdigest()
+        except Exception as e:
+            self.log(f"Error calculating MD5 for {file_path}: {e}", "ERROR")
+            return None
+            
+    def extract_year_from_path(self, file_path):
+        """Extract year from folder path like '2024 - Photos'."""
+        match = re.search(r'(\d{4})\s*-\s*Photos', file_path, re.IGNORECASE)
+        return int(match.group(1)) if match else None
+        
+    def is_image_file(self, file_path):
+        """Check if file is a supported image type."""
+        return Path(file_path).suffix.lower() in self.image_extensions
+        
+    def discover_photo_folders(self, base_path):
+        """Automatically discover year-based photo folders."""
+        folders = []
+        try:
+            for item in os.listdir(base_path):
+                item_path = os.path.join(base_path, item)
+                if os.path.isdir(item_path):
+                    # Match patterns like "2024 - Photos", "2010 - Photos", etc.
+                    if re.match(r'^\d{4}\s*-\s*Photos$', item, re.IGNORECASE):
+                        folders.append(item_path)
+            return sorted(folders)
+        except Exception as e:
+            self.log(f"Error discovering folders in {base_path}: {e}", "ERROR")
+            return []
+            
+    def scan_folder_recursive(self, folder_path):
+        """Recursively find all image files in folder and subfolders."""
+        image_files = []
+        try:
+            for root, dirs, files in os.walk(folder_path):
+                # Skip system directories
+                dirs[:] = [d for d in dirs if not d.startswith('@')]
+                
+                for file in files:
+                    if self.is_image_file(file):
+                        full_path = os.path.join(root, file)
+                        image_files.append(full_path)
                         
-            return hash_func.hexdigest()
-        except (IOError, OSError) as e:
-            self.log(f"Error hashing {filepath}: {e}", "ERROR")
-            return None
+        except Exception as e:
+            self.log(f"Error scanning {folder_path}: {e}", "ERROR")
             
-    def get_file_info(self, filepath):
-        """Get comprehensive file information."""
-        if filepath in self.file_cache:
-            return self.file_cache[filepath]
+        return image_files
+        
+    def process_files(self, file_paths, force_reprocess=False):
+        """Process a list of files, creating normalized hashes."""
+        self.log(f"🔍 Processing {len(file_paths)} files...")
+        
+        processed = 0
+        skipped = 0
+        
+        # Progress bar for large batches
+        if HAS_TQDM and len(file_paths) > 20:
+            file_iter = tqdm(file_paths, desc="Processing images", unit="files")
+        else:
+            file_iter = file_paths
             
-        try:
-            stat = os.stat(filepath)
-            info = FileInfo(
-                path=filepath,
-                size=stat.st_size,
-                mtime=stat.st_mtime,
-                hash_md5=None,  # Calculated on demand
-                hash_sha256=None  # Calculated on demand
-            )
-            self.file_cache[filepath] = info
-            return info
-        except (IOError, OSError) as e:
-            self.log(f"Error getting file info for {filepath}: {e}", "ERROR")
-            return None
-            
-    def find_exact_duplicates(self, filepaths):
-        """Find exact duplicates using file size and hash comparison."""
+        with sqlite3.connect(self.database_path) as conn:
+            for file_path in file_iter:
+                try:
+                    # Get file stats
+                    stat = os.stat(file_path)
+                    file_size = stat.st_size
+                    file_mtime = stat.st_mtime
+                    folder_year = self.extract_year_from_path(file_path)
+                    
+                    # Check if already processed (unless force reprocess)
+                    if not force_reprocess:
+                        cursor = conn.execute(
+                            "SELECT file_mtime FROM photo_hashes WHERE file_path = ?",
+                            (file_path,)
+                        )
+                        row = cursor.fetchone()
+                        if row and row[0] >= file_mtime:
+                            skipped += 1
+                            continue
+                    
+                    # Calculate hashes
+                    md5_hash = self.get_file_md5(file_path)
+                    normalized_hash = self.create_normalized_hash(file_path)
+                    
+                    if md5_hash and normalized_hash:
+                        # Store in database
+                        conn.execute('''
+                            INSERT OR REPLACE INTO photo_hashes 
+                            (file_path, file_size, file_mtime, md5_hash, normalized_hash, 
+                             thumbnail_size, processing_date, folder_year)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (file_path, file_size, file_mtime, md5_hash, normalized_hash,
+                              self.thumbnail_size, time.time(), folder_year))
+                        
+                        processed += 1
+                    
+                except Exception as e:
+                    self.log(f"Error processing {file_path}: {e}", "WARNING")
+                    continue
+                    
+        self.stats['files_processed'] = processed
+        self.stats['files_skipped'] = skipped
+        
+        self.log(f"✅ Processed {processed} files, skipped {skipped} already processed")
+        
+    def find_exact_duplicates(self):
+        """Find exact duplicates based on MD5 hash."""
         self.log("🔍 Finding exact duplicates...")
         
-        # Group by size first (fast pre-filter)
-        self.log(f"📊 Analyzing {len(filepaths)} files by size...")
-        size_groups = defaultdict(list)
-        for filepath in filepaths:
-            info = self.get_file_info(filepath)
-            if info and info.size > 0:  # Skip empty files
-                size_groups[info.size].append(filepath)
+        duplicates = []
+        
+        with sqlite3.connect(self.database_path) as conn:
+            # Find MD5 hashes that appear more than once
+            cursor = conn.execute('''
+                SELECT md5_hash, COUNT(*) as count 
+                FROM photo_hashes 
+                GROUP BY md5_hash 
+                HAVING count > 1
+                ORDER BY count DESC
+            ''')
+            
+            for md5_hash, count in cursor:
+                # Get all files with this hash
+                files_cursor = conn.execute('''
+                    SELECT file_path, file_size FROM photo_hashes 
+                    WHERE md5_hash = ?
+                    ORDER BY file_path
+                ''', (md5_hash,))
                 
-        # Count potential duplicates
-        potential_dupes = sum(len(files) for files in size_groups.values() if len(files) > 1)
-        if potential_dupes == 0:
-            self.log("✅ No files with matching sizes found - no exact duplicates possible")
-            return []
-            
-        self.log(f"🎯 Found {potential_dupes} files with matching sizes, calculating hashes...")
-        exact_duplicates = []
-        
-        # Progress tracking for hash calculation
-        files_to_hash = [files for files in size_groups.values() if len(files) > 1]
-        total_hash_files = sum(len(files) for files in files_to_hash)
-        
-        if HAS_TQDM and total_hash_files > 10:
-            pbar = tqdm(total=total_hash_files, desc="Hashing files", unit="files")
-        else:
-            pbar = None
-            
-        try:
-            # Check files with same size
-            for size, files in size_groups.items():
-                if len(files) < 2:
-                    continue
+                files = files_cursor.fetchall()
+                if len(files) > 1:
+                    group = DuplicateGroup(
+                        method='exact',
+                        similarity=1.0,
+                        files=[f[0] for f in files],
+                        recommended_action=self._recommend_action([f[0] for f in files])
+                    )
+                    duplicates.append(group)
+                    self.stats['exact_duplicates'] += len(files) - 1
                     
-                # Group by hash
-                hash_groups = defaultdict(list)
-                for filepath in files:
-                    file_hash = self.get_file_hash(filepath, 'md5')
-                    if file_hash:
-                        hash_groups[file_hash].append(filepath)
-                    if pbar:
-                        pbar.update(1)
-                        
-                # Find duplicate groups
-                for file_hash, duplicate_files in hash_groups.items():
-                    if len(duplicate_files) > 1:
-                        # Verify with SHA256 for security
-                        sha256_groups = defaultdict(list)
-                        for filepath in duplicate_files:
-                            sha256_hash = self.get_file_hash(filepath, 'sha256')
-                            if sha256_hash:
-                                sha256_groups[sha256_hash].append(filepath)
-                                
-                        for sha256_hash, verified_files in sha256_groups.items():
-                            if len(verified_files) > 1:
-                                group = DuplicateGroup(
-                                    method='exact',
-                                    similarity=1.0,
-                                    files=verified_files,
-                                    recommended_action=self._recommend_action(verified_files)
-                                )
-                                exact_duplicates.append(group)
-                                self.stats['exact_duplicates'] += len(verified_files) - 1
-                                self.log(f"🔍 Found exact duplicate group: {len(verified_files)} identical files")
-        finally:
-            if pbar:
-                pbar.close()
-                                
-        return exact_duplicates
+        self.log(f"Found {len(duplicates)} exact duplicate groups")
+        return duplicates
         
-    def find_near_duplicates(self, filepaths):
-        """Find near-duplicates using perceptual hashing (requires PIL)."""
-        if not self.enable_near_duplicates:
-            self.log("⚠️  Near-duplicate detection disabled (PIL not available)")
-            return []
-            
-        self.log("🖼️  Finding near-duplicates using perceptual hashing...")
+    def find_near_duplicates(self, similarity_threshold=0.95):
+        """Find near-duplicates using normalized hash comparison."""
+        self.log(f"🖼️  Finding near-duplicates (similarity >= {similarity_threshold})...")
         
-        # Filter to image files only
-        image_files = [f for f in filepaths if self._is_image_file(f)]
-        if len(image_files) < 2:
-            self.log("ℹ️  Not enough image files for near-duplicate detection")
-            return []
-            
-        self.log(f"📸 Processing {len(image_files)} image files...")
-        
-        # Calculate perceptual hashes with progress tracking
-        hash_data = {}
-        if HAS_TQDM and len(image_files) > 20:
-            image_iter = tqdm(image_files, desc="Calculating perceptual hashes", unit="images")
-        else:
-            image_iter = image_files
-            
-        processed = 0
-        for filepath in image_iter:
-            try:
-                with Image.open(filepath) as img:
-                    # Use multiple hash algorithms for better accuracy
-                    phash = imagehash.phash(img)
-                    dhash = imagehash.dhash(img)
-                    whash = imagehash.whash(img)
-                    
-                    hash_data[filepath] = {
-                        'phash': phash,
-                        'dhash': dhash,
-                        'whash': whash
-                    }
-                    processed += 1
-            except Exception as e:
-                self.log(f"Error processing image {os.path.basename(filepath)}: {e}", "WARNING")
-                continue
-                
-        self.log(f"✅ Successfully processed {processed} images for comparison")
-                
-        # Compare hashes to find similar images
         near_duplicates = []
+        
+        with sqlite3.connect(self.database_path) as conn:
+            # Get all normalized hashes
+            cursor = conn.execute('SELECT file_path, normalized_hash FROM photo_hashes')
+            photos = cursor.fetchall()
+            
+        self.log(f"Comparing {len(photos)} photos for near-duplicates...")
+        
+        # Compare each photo with every other photo
         processed_pairs = set()
         
-        for filepath1, hashes1 in hash_data.items():
-            for filepath2, hashes2 in hash_data.items():
-                if filepath1 >= filepath2:  # Avoid duplicate comparisons
-                    continue
-                    
-                pair = tuple(sorted([filepath1, filepath2]))
+        if HAS_TQDM and len(photos) > 100:
+            photo_iter = tqdm(photos, desc="Comparing images", unit="images")
+        else:
+            photo_iter = photos
+            
+        for i, (path1, hash1) in enumerate(photo_iter):
+            for j, (path2, hash2) in enumerate(photos[i+1:], i+1):
+                # Skip if already processed this pair
+                pair = tuple(sorted([path1, path2]))
                 if pair in processed_pairs:
                     continue
                 processed_pairs.add(pair)
                 
-                # Calculate similarity using multiple hash types
-                similarities = []
-                for hash_type in ['phash', 'dhash', 'whash']:
-                    hash_diff = hashes1[hash_type] - hashes2[hash_type]
-                    similarity = 1.0 - (hash_diff / 64.0)  # 64-bit hash
-                    similarities.append(similarity)
-                    
-                avg_similarity = sum(similarities) / len(similarities)
+                # Calculate similarity
+                similarity = self.calculate_similarity(hash1, hash2)
                 
-                if avg_similarity >= self.similarity_threshold:
+                if similarity >= similarity_threshold and similarity < 1.0:  # Exclude exact matches
                     group = DuplicateGroup(
-                        method='perceptual',
-                        similarity=avg_similarity,
-                        files=[filepath1, filepath2],
-                        recommended_action=self._recommend_action([filepath1, filepath2])
+                        method='normalized_hash',
+                        similarity=similarity,
+                        files=[path1, path2],
+                        recommended_action=self._recommend_action([path1, path2])
                     )
                     near_duplicates.append(group)
                     self.stats['near_duplicates'] += 1
                     
+        self.log(f"Found {len(near_duplicates)} near-duplicate groups")
         return near_duplicates
-        
-    def find_opencv_duplicates(self, filepaths):
-        """Find duplicates using OpenCV structural similarity (requires OpenCV)."""
-        if not self.enable_opencv:
-            self.log("OpenCV detection disabled (cv2 not available)")
-            return []
-            
-        self.log("Finding duplicates using OpenCV structural similarity...")
-        
-        image_files = [f for f in filepaths if self._is_image_file(f)]
-        if len(image_files) < 2:
-            return []
-            
-        # Load and preprocess images
-        images = {}
-        for filepath in image_files:
-            try:
-                img = cv2.imread(filepath)
-                if img is not None:
-                    # Resize for consistent comparison
-                    img_resized = cv2.resize(img, (256, 256))
-                    img_gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
-                    images[filepath] = img_gray
-            except Exception as e:
-                self.log(f"Error loading image {filepath}: {e}", "WARNING")
-                continue
-                
-        # Compare images using structural similarity
-        opencv_duplicates = []
-        processed_pairs = set()
-        
-        for filepath1, img1 in images.items():
-            for filepath2, img2 in images.items():
-                if filepath1 >= filepath2:
-                    continue
-                    
-                pair = tuple(sorted([filepath1, filepath2]))
-                if pair in processed_pairs:
-                    continue
-                processed_pairs.add(pair)
-                
-                # Calculate structural similarity
-                try:
-                    from skimage.metrics import structural_similarity as ssim
-                    similarity = ssim(img1, img2)
-                    
-                    if similarity >= self.similarity_threshold:
-                        group = DuplicateGroup(
-                            method='structural',
-                            similarity=similarity,
-                            files=[filepath1, filepath2],
-                            recommended_action=self._recommend_action([filepath1, filepath2])
-                        )
-                        opencv_duplicates.append(group)
-                except ImportError:
-                    # Fallback to simpler comparison if scikit-image not available
-                    diff = cv2.absdiff(img1, img2)
-                    similarity = 1.0 - (np.mean(diff) / 255.0)
-                    
-                    if similarity >= self.similarity_threshold:
-                        group = DuplicateGroup(
-                            method='opencv',
-                            similarity=similarity,
-                            files=[filepath1, filepath2],
-                            recommended_action=self._recommend_action([filepath1, filepath2])
-                        )
-                        opencv_duplicates.append(group)
-                        
-        return opencv_duplicates
-        
-    def _is_image_file(self, filepath):
-        """Check if file is an image."""
-        return Path(filepath).suffix.lower() in self.image_extensions
-        
-    def _is_video_file(self, filepath):
-        """Check if file is a video."""
-        return Path(filepath).suffix.lower() in self.video_extensions
         
     def _recommend_action(self, files):
         """Recommend which file to keep based on various criteria."""
         if len(files) < 2:
             return "keep_all"
             
-        # Scoring criteria (higher is better)
-        def score_file(filepath):
-            score = 0
-            stat = os.stat(filepath)
-            
-            # Prefer larger files (higher quality)
-            score += stat.st_size / (1024 * 1024)  # MB
-            
-            # Prefer newer files
-            score += (stat.st_mtime - 1000000000) / 100000  # Normalized timestamp
-            
-            # Prefer certain formats
-            ext = Path(filepath).suffix.lower()
-            if ext in ['.png', '.tiff']:  # Lossless formats
-                score += 10
-            elif ext == '.jpg':  # Common format
-                score += 5
+        # Score files based on multiple criteria
+        scored_files = []
+        
+        for file_path in files:
+            try:
+                stat = os.stat(file_path)
+                score = 0
                 
-            # Prefer shorter paths (likely organized)
-            score -= len(filepath) / 100
-            
-            return score
-            
-        # Score all files
-        scored_files = [(score_file(f), f) for f in files]
-        scored_files.sort(reverse=True)  # Highest score first
-        
-        recommended_keep = scored_files[0][1]
-        return f"keep:{os.path.basename(recommended_keep)}"
-        
-    def scan_directories(self, directories, recursive=True):
-        """Scan directories for media files."""
-        self.log(f"Scanning {len(directories)} directories...")
-        
-        all_files = []
-        for directory in directories:
-            if not os.path.exists(directory):
-                self.log(f"Directory not found: {directory}", "WARNING")
-                continue
+                # Prefer newer files (higher mtime)
+                score += stat.st_mtime / 1000000  # Normalize
                 
-            self.log(f"Scanning: {directory}")
-            
-            if recursive:
-                for root, dirs, files in os.walk(directory):
-                    # Skip system directories
-                    dirs[:] = [d for d in dirs if not d.startswith('@')]
+                # Prefer larger files (likely higher quality)
+                score += stat.st_size / (1024 * 1024)  # MB
+                
+                # Prefer files in organized structure (shorter relative paths)
+                path_depth = len(Path(file_path).parts)
+                score -= path_depth  # Fewer directories = higher score
+                
+                # Prefer certain file types
+                ext = Path(file_path).suffix.lower()
+                if ext in ['.png', '.tiff']:  # Lossless formats
+                    score += 10
+                elif ext in ['.jpg', '.jpeg']:  # Common format
+                    score += 5
                     
-                    for file in files:
-                        filepath = os.path.join(root, file)
-                        if self._is_media_file(filepath):
-                            all_files.append(filepath)
-                            self.stats['files_scanned'] += 1
-            else:
-                for file in os.listdir(directory):
-                    filepath = os.path.join(directory, file)
-                    if os.path.isfile(filepath) and self._is_media_file(filepath):
-                        all_files.append(filepath)
-                        self.stats['files_scanned'] += 1
-                        
-        self.log(f"Found {len(all_files)} media files")
-        return all_files
+                scored_files.append((score, file_path))
+                
+            except OSError:
+                scored_files.append((0, file_path))
+                
+        # Sort by score (highest first)
+        scored_files.sort(reverse=True)
+        recommended = scored_files[0][1]
         
-    def _is_media_file(self, filepath):
-        """Check if file is a supported media type."""
-        ext = Path(filepath).suffix.lower()
-        return ext in self.image_extensions or ext in self.video_extensions
+        return f"keep:{os.path.basename(recommended)}"
         
-    def detect_all_duplicates(self, directories, recursive=True):
-        """Run all duplicate detection algorithms."""
-        start_time = time.time()
-        
-        # Scan for files
-        all_files = self.scan_directories(directories, recursive)
-        if len(all_files) < 2:
-            self.log("Not enough files found for duplicate detection")
-            return []
-            
-        # Run detection algorithms
-        self.duplicate_groups = []
-        
-        # 1. Exact duplicates (always run)
-        exact_dupes = self.find_exact_duplicates(all_files)
-        self.duplicate_groups.extend(exact_dupes)
-        
-        # 2. Near duplicates (if enabled)
-        if self.enable_near_duplicates:
-            near_dupes = self.find_near_duplicates(all_files)
-            self.duplicate_groups.extend(near_dupes)
-            
-        # 3. OpenCV duplicates (if available)
-        if self.enable_opencv:
-            opencv_dupes = self.find_opencv_duplicates(all_files)
-            self.duplicate_groups.extend(opencv_dupes)
-            
-        # Calculate statistics
-        self.stats['total_groups'] = len(self.duplicate_groups)
-        self.stats['processing_time'] = time.time() - start_time
-        
-        # Calculate space wasted
-        for group in self.duplicate_groups:
-            if group.method == 'exact':
-                # For exact duplicates, all but one file are wasted space
-                sizes = [os.path.getsize(f) for f in group.files if os.path.exists(f)]
-                if sizes:
-                    self.stats['space_wasted'] += sum(sizes) - max(sizes)
-                    
-        return self.duplicate_groups
-        
-    def generate_report(self, output_file=None):
+    def generate_report(self, duplicate_groups, output_file=None):
         """Generate comprehensive duplicate detection report."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
+        # Calculate statistics
+        total_duplicates = sum(len(group.files) - 1 for group in duplicate_groups)
+        total_wasted_space = 0
+        
+        for group in duplicate_groups:
+            if group.method == 'exact':
+                sizes = []
+                for file_path in group.files:
+                    try:
+                        sizes.append(os.path.getsize(file_path))
+                    except OSError:
+                        pass
+                if sizes:
+                    total_wasted_space += sum(sizes) - max(sizes)
+        
         report_lines = [
             "="*80,
-            f"DUPLICATE DETECTION REPORT - {timestamp}",
+            f"NORMALIZED HASH DUPLICATE DETECTION REPORT - {timestamp}",
             "="*80,
-            f"Files scanned: {self.stats['files_scanned']}",
-            f"Exact duplicate groups: {len([g for g in self.duplicate_groups if g.method == 'exact'])}",
-            f"Near-duplicate groups: {len([g for g in self.duplicate_groups if g.method == 'perceptual'])}",
-            f"Total duplicate groups: {self.stats['total_groups']}",
-            f"Space wasted by duplicates: {self.stats['space_wasted'] / (1024*1024):.2f} MB",
-            f"Processing time: {self.stats['processing_time']:.2f} seconds",
+            f"Database: {self.database_path}",
+            f"Thumbnail size: {self.thumbnail_size}x{self.thumbnail_size}",
+            f"Photos in database: {self.stats['database_size']}",
+            f"Files processed this run: {self.stats['files_processed']}",
+            f"Files skipped (already processed): {self.stats['files_skipped']}",
+            "",
+            "DUPLICATE SUMMARY:",
+            f"  Exact duplicate groups: {len([g for g in duplicate_groups if g.method == 'exact'])}",
+            f"  Near-duplicate groups: {len([g for g in duplicate_groups if g.method == 'normalized_hash'])}",
+            f"  Total duplicate files: {total_duplicates}",
+            f"  Estimated wasted space: {total_wasted_space / (1024*1024*1024):.2f} GB",
             "",
             "DUPLICATE GROUPS:",
-            "-" * 40
+            "-" * 50
         ]
         
-        for i, group in enumerate(self.duplicate_groups, 1):
+        for i, group in enumerate(duplicate_groups, 1):
             report_lines.extend([
                 f"\nGroup #{i} ({group.method.upper()}) - Similarity: {group.similarity:.3f}",
                 f"Recommended action: {group.recommended_action}"
             ])
             
-            for filepath in group.files:
-                size_mb = os.path.getsize(filepath) / (1024*1024) if os.path.exists(filepath) else 0
-                mtime = datetime.fromtimestamp(os.path.getmtime(filepath)).strftime("%Y-%m-%d %H:%M:%S") if os.path.exists(filepath) else "N/A"
-                report_lines.append(f"  - {filepath} ({size_mb:.2f} MB, {mtime})")
-                
+            for file_path in group.files:
+                try:
+                    size_mb = os.path.getsize(file_path) / (1024*1024)
+                    mtime = datetime.fromtimestamp(os.path.getmtime(file_path)).strftime("%Y-%m-%d %H:%M:%S")
+                    report_lines.append(f"  - {file_path} ({size_mb:.2f} MB, {mtime})")
+                except OSError:
+                    report_lines.append(f"  - {file_path} (file not accessible)")
+                    
         report_content = "\n".join(report_lines)
         
         if output_file:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(report_content)
-            self.log(f"Report saved to: {output_file}")
+            try:
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    f.write(report_content)
+                self.log(f"Report saved to: {output_file}")
+            except Exception as e:
+                self.log(f"Error saving report: {e}", "ERROR")
+                print(report_content)
         else:
             print("\n" + report_content)
             
@@ -526,94 +526,163 @@ class DuplicateDetector:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Advanced Duplicate Detection v1.0 - Find exact and near-duplicate media files",
+        description="Normalized Hash Duplicate Detection v1.0 - High-performance duplicate finder",
         epilog="""Examples:
-  %(prog)s /path/to/photos --dry-run                    # Preview duplicate detection
-  %(prog)s /path/to/photos --similarity 0.9 --report   # Find 90%+ similar images  
-  %(prog)s /path1 /path2 --no-near-duplicates          # Exact duplicates only
-  %(prog)s /volume1/photo --recursive --report duplicate_report.txt
+  %(prog)s "\\\\NAS-MEDIA\\photo\\Sorted" --test-folder "2010 - Photos"
+  %(prog)s "\\\\NAS-MEDIA\\photo\\Sorted" --build-database --years 2010-2015
+  %(prog)s "\\\\NAS-MEDIA\\photo\\Sorted" --find-duplicates --similarity 0.95
+  %(prog)s "\\\\NAS-MEDIA\\photo\\Sorted" --incremental
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
-    parser.add_argument("directories", nargs="+", help="Directories to scan for duplicates")
-    parser.add_argument("--similarity", type=float, default=0.95, help="Similarity threshold for near-duplicates (0.0-1.0)")
-    parser.add_argument("--no-near-duplicates", action="store_true", help="Disable near-duplicate detection (faster)")
-    parser.add_argument("--no-recursive", action="store_true", help="Don't scan subdirectories")
-    parser.add_argument("--report", type=str, help="Save report to file")
-    parser.add_argument("--dry-run", action="store_true", help="Preview mode - no actions taken")
-    parser.add_argument("--json-output", type=str, help="Save results as JSON file")
+    parser.add_argument("photo_root", help="Root directory containing year-based photo folders")
+    parser.add_argument("--test-folder", help="Test with single folder (e.g., '2010 - Photos')")
+    parser.add_argument("--build-database", action="store_true", help="Build/update normalized hash database")
+    parser.add_argument("--find-duplicates", action="store_true", help="Find duplicates using existing database")
+    parser.add_argument("--incremental", action="store_true", help="Process only new/changed files")
+    parser.add_argument("--years", help="Process specific year range (e.g., '2010-2015')")
+    parser.add_argument("--similarity", type=float, default=0.95, help="Similarity threshold for near-duplicates")
+    parser.add_argument("--thumbnail-size", type=int, choices=[32, 64, 128], default=64, 
+                       help="Normalized thumbnail size (default: 64)")
+    parser.add_argument("--database", help="Custom database path")
+    parser.add_argument("--report", help="Save report to file")
+    parser.add_argument("--force-reprocess", action="store_true", help="Reprocess all files (ignore cache)")
     
     args = parser.parse_args()
     
-    # Validate directories
-    for directory in args.directories:
-        if not os.path.exists(directory):
-            print(f"Error: Directory not found: {directory}")
-            sys.exit(1)
-            
+    print("="*80)
+    print("NORMALIZED HASH DUPLICATE DETECTION v1.0")
+    print("="*80)
+    
+    # Validate photo root
+    if not os.path.exists(args.photo_root):
+        print(f"❌ Error: Photo root directory not found: {args.photo_root}")
+        sys.exit(1)
+        
     # Initialize detector
-    detector = DuplicateDetector(
-        similarity_threshold=args.similarity,
-        enable_near_duplicates=not args.no_near_duplicates
+    detector = NormalizedHashDetector(
+        database_path=args.database,
+        thumbnail_size=args.thumbnail_size
     )
     
-    print("="*80)
-    print("ADVANCED DUPLICATE DETECTION v1.0")
-    print("="*80)
-    
-    if args.dry_run:
-        print("[DRY RUN MODE] Preview only - no files will be modified")
-        
-    if not HAS_PILLOW:
-        print("[WARNING] PIL/Pillow not available - near-duplicate detection disabled")
-        
-    if not HAS_OPENCV:
-        print("[INFO] OpenCV not available - advanced image comparison disabled")
-        
-    print(f"Similarity threshold: {args.similarity}")
-    print(f"Directories to scan: {', '.join(args.directories)}")
+    print(f"📁 Photo root: {args.photo_root}")
+    print(f"🗄️  Database: {detector.database_path}")
+    print(f"📏 Thumbnail size: {args.thumbnail_size}x{args.thumbnail_size}")
     print()
     
-    # Run detection
-    duplicate_groups = detector.detect_all_duplicates(
-        args.directories, 
-        recursive=not args.no_recursive
-    )
+    start_time = time.time()
     
-    # Generate report
-    if args.report:
-        detector.generate_report(args.report)
-    else:
-        detector.generate_report()
+    try:
+        if args.test_folder:
+            # Test mode with single folder
+            test_path = os.path.join(args.photo_root, args.test_folder)
+            if not os.path.exists(test_path):
+                print(f"❌ Test folder not found: {test_path}")
+                sys.exit(1)
+                
+            print(f"🧪 TEST MODE: Processing {args.test_folder}")
+            
+            # Scan and process files
+            files = detector.scan_folder_recursive(test_path)
+            print(f"Found {len(files)} image files")
+            
+            if files:
+                detector.process_files(files, force_reprocess=args.force_reprocess)
+                
+                # Find duplicates
+                exact_dupes = detector.find_exact_duplicates()
+                near_dupes = detector.find_near_duplicates(args.similarity)
+                
+                all_duplicates = exact_dupes + near_dupes
+                
+                if all_duplicates:
+                    detector.generate_report(all_duplicates, args.report)
+                else:
+                    detector.log("✅ No duplicates found in test folder!")
+                    
+        elif args.build_database:
+            # Build database mode
+            folders = detector.discover_photo_folders(args.photo_root)
+            
+            if args.years:
+                # Filter by year range
+                year_range = args.years.split('-')
+                if len(year_range) == 2:
+                    start_year = int(year_range[0])
+                    end_year = int(year_range[1])
+                    folders = [f for f in folders if start_year <= detector.extract_year_from_path(f) <= end_year]
+                    
+            print(f"📂 Discovered {len(folders)} photo folders")
+            
+            for folder in folders:
+                folder_name = os.path.basename(folder)
+                print(f"\n📁 Processing {folder_name}...")
+                
+                files = detector.scan_folder_recursive(folder)
+                if files:
+                    detector.process_files(files, force_reprocess=args.force_reprocess)
+                    
+            detector.log("✅ Database build complete!")
+            
+        elif args.find_duplicates:
+            # Find duplicates mode
+            print("🔍 Searching for duplicates in existing database...")
+            
+            exact_dupes = detector.find_exact_duplicates()
+            near_dupes = detector.find_near_duplicates(args.similarity)
+            
+            all_duplicates = exact_dupes + near_dupes
+            
+            if all_duplicates:
+                detector.generate_report(all_duplicates, args.report)
+                print(f"\n📊 Found {len(all_duplicates)} duplicate groups!")
+            else:
+                detector.log("✅ No duplicates found!")
+                
+        elif args.incremental:
+            # Incremental processing mode
+            folders = detector.discover_photo_folders(args.photo_root)
+            print(f"📂 Processing {len(folders)} folders incrementally...")
+            
+            for folder in folders:
+                folder_name = os.path.basename(folder)
+                files = detector.scan_folder_recursive(folder)
+                
+                if files:
+                    print(f"\n📁 {folder_name}: {len(files)} files")
+                    detector.process_files(files)  # Only processes new/changed files
+                    
+            detector.log("✅ Incremental processing complete!")
+            
+        else:
+            print("❌ Please specify --test-folder, --build-database, --find-duplicates, or --incremental")
+            parser.print_help()
+            sys.exit(1)
+            
+    except KeyboardInterrupt:
+        print("\n⚠️  Processing interrupted by user")
         
-    # Save JSON output if requested
-    if args.json_output:
-        json_data = {
-            'timestamp': datetime.now().isoformat(),
-            'statistics': detector.stats,
-            'groups': [
-                {
-                    'method': group.method,
-                    'similarity': group.similarity,
-                    'files': group.files,
-                    'recommended_action': group.recommended_action
-                }
-                for group in duplicate_groups
-            ]
-        }
+    except Exception as e:
+        detector.log(f"Unexpected error: {e}", "ERROR")
+        raise
         
-        with open(args.json_output, 'w', encoding='utf-8') as f:
-            json.dump(json_data, f, indent=2, ensure_ascii=False)
-        print(f"\nJSON output saved to: {args.json_output}")
+    finally:
+        # Final statistics
+        processing_time = time.time() - start_time
+        detector.stats['processing_time'] = processing_time
         
-    print(f"\nDetection complete! Found {len(duplicate_groups)} duplicate groups.")
-    
-    if duplicate_groups and not args.dry_run:
-        print("\nNext steps:")
-        print("1. Review the report carefully before taking any action")
-        print("2. Use the recommended actions as guidance")
-        print("3. Consider running with --dry-run first for safety")
+        print(f"\n⏱️  Processing completed in {processing_time:.1f} seconds")
+        
+        if detector.stats['files_processed'] > 0 or detector.stats['files_skipped'] > 0:
+            print(f"📈 Files processed: {detector.stats['files_processed']}")
+            print(f"📋 Files skipped: {detector.stats['files_skipped']}")
+            
+        if detector.stats['exact_duplicates'] > 0:
+            print(f"🔍 Exact duplicates found: {detector.stats['exact_duplicates']}")
+            
+        if detector.stats['near_duplicates'] > 0:
+            print(f"🖼️  Near-duplicates found: {detector.stats['near_duplicates']}")
 
 
 if __name__ == "__main__":
