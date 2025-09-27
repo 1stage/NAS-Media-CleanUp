@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 detect_duplicates.py
-Version 1.0 - Normalized Hash Duplicate Detection
+Version 0.3 — Created by Sean P. Harrington with assistance from Microsoft Copilot
+Date: Friday, 27 September 2025
 
 High-performance duplicate detection using normalized image hashing for massive
 photo collections. Designed for interactive laptop-based analysis of NAS media.
@@ -46,6 +47,14 @@ except ImportError:
     print("❌ ERROR: PIL/Pillow is required for normalized hash algorithm")
     print("Install with: pip install Pillow")
     sys.exit(1)
+
+# Enable HEIC/HEIF support if available
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HAS_HEIF = True
+except ImportError:
+    HAS_HEIF = False
 
 # Optional dependencies
 try:
@@ -526,7 +535,7 @@ class NormalizedHashDetector:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Normalized Hash Duplicate Detection v1.0 - High-performance duplicate finder",
+        description="Normalized Hash Duplicate Detection v0.3 - High-performance duplicate finder",
         epilog="""Examples:
   %(prog)s "\\\\NAS-MEDIA\\photo\\Sorted" --test-folder "2010 - Photos"
   %(prog)s "\\\\NAS-MEDIA\\photo\\Sorted" --build-database --years 2010-2015
@@ -548,11 +557,12 @@ def main():
     parser.add_argument("--database", help="Custom database path")
     parser.add_argument("--report", help="Save report to file")
     parser.add_argument("--force-reprocess", action="store_true", help="Reprocess all files (ignore cache)")
+    parser.add_argument("--version", action="version", version="Normalized Hash Duplicate Detection v0.3")
     
     args = parser.parse_args()
     
     print("="*80)
-    print("NORMALIZED HASH DUPLICATE DETECTION v1.0")
+    print("NORMALIZED HASH DUPLICATE DETECTION v0.3")
     print("="*80)
     
     # Validate photo root
