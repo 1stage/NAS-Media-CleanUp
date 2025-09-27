@@ -472,25 +472,73 @@ class SafeDuplicateDetector:
             print()  # New line after dots
         print(f"\n✅ Total: {total_files} image files across {len(self.folder_paths)} folders ({updated_files} updated)")
         
+        # CROSS-DATABASE DUPLICATE DETECTION: Check for matches with previously scanned files
+        print("🔍 Checking for duplicates against previously scanned folders...")
+        current_scan_files = set()
+        for files in hash_groups.values():
+            current_scan_files.update(files)
+        
+        database_matches = 0
+        for hash_val, files in list(hash_groups.items()):
+            # Query database for other files with same hash that weren't just scanned
+            existing_matches = self.conn.execute("""
+                SELECT file_path FROM safe_files 
+                WHERE normalized_hash = ? AND file_path NOT IN ({})
+            """.format(','.join('?' * len(current_scan_files))), 
+            [hash_val] + list(current_scan_files)).fetchall()
+            
+            if existing_matches:
+                for row in existing_matches:
+                    hash_groups[hash_val].append(row[0])
+                    database_matches += 1
+                if self.verbose:
+                    print(f"  Found {len(existing_matches)} database matches for hash {hash_val[:8]}...")
+        
+        if database_matches > 0:
+            print(f"📂 Found {database_matches} potential duplicates from previously scanned folders")
+        
         # Identify potential duplicate groups (2+ files with same hash)
         potential_groups = {hash_val: files for hash_val, files in hash_groups.items() 
                           if len(files) > 1}
         
-        # Analyze cross-folder duplicates
+        # Analyze duplicate group types
         cross_folder_groups = 0
+        cross_database_groups = 0
+        current_scan_folders = set(str(folder) for folder in self.folder_paths)
+        
         for hash_val, files in potential_groups.items():
             folder_contexts = set()
+            has_current_scan = False
+            has_database_files = False
+            
             for file_path in files:
-                for folder in self.folder_paths:
-                    if str(folder) in file_path:
-                        folder_contexts.add(str(folder))
-                        break
-            if len(folder_contexts) > 1:
+                # Check if file is from current scan folders
+                is_current_scan = any(str(folder) in file_path for folder in self.folder_paths)
+                if is_current_scan:
+                    has_current_scan = True
+                    for folder in self.folder_paths:
+                        if str(folder) in file_path:
+                            folder_contexts.add(str(folder))
+                            break
+                else:
+                    has_database_files = True
+                    # Determine folder context for database files
+                    folder_context = self.conn.execute(
+                        "SELECT folder_context FROM safe_files WHERE file_path = ?",
+                        (file_path,)
+                    ).fetchone()
+                    if folder_context:
+                        folder_contexts.add(folder_context[0])
+            
+            if has_database_files and has_current_scan:
+                cross_database_groups += 1
+            elif len(folder_contexts) > 1:
                 cross_folder_groups += 1
         
         print(f"Found {len(potential_groups)} potential duplicate groups")
-        print(f"  - {cross_folder_groups} cross-folder groups")
-        print(f"  - {len(potential_groups) - cross_folder_groups} single-folder groups")
+        print(f"  - {cross_database_groups} cross-database groups (current scan + previous scans)")
+        print(f"  - {cross_folder_groups} cross-folder groups (within current scan)")
+        print(f"  - {len(potential_groups) - cross_folder_groups - cross_database_groups} single-folder groups")
         
         return potential_groups
     
