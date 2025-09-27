@@ -1,22 +1,31 @@
 """
 organize_by_year.py
-Version 0.11 (Pre-release) — Created by Sean P. Harrington with assistance from Microsoft Copilot  
-Date: Friday, 26 September 2025, 4:30 PM PDT
+Version 1.0 — Created by Sean P. Harrington with assistance from Microsoft Copilot  
+Date: Friday, 27 September 2025
 
-Organizes photos and videos from one or more upload directories into year-based folders
-based on their metadata creation date. Designed for use with a NAS setup.
+A comprehensive media organization tool that automatically sorts photos and videos
+by year into organized directory structures. Production-ready with enterprise-grade features:
 
-Enhanced with improved file locking handling and retry mechanisms.
+- EXIF data extraction for accurate photo dating
+- Intelligent file type detection using multiple libraries
+- Fast duplicate detection and removal
+- Filename collision handling with smart renaming
+- Empty directory cleanup
+- Comprehensive logging and reporting
+- Retry logic for locked files
+- UNC path support for Windows networks
 
 Usage:
-    python organize_by_year.py [--dry-run] [--report] [--limit N] [--delete-duplicates]
+    python organize_by_year.py [--dry-run] [--report] [--limit N] [--delete-duplicates] [--handle-collisions] [--cleanup-empty-dirs]
 
 Options:
-    --dry-run            Preview actions without moving any files.
-    --report             Generate a summary report of moved files.
-    --limit N            Limit number of files to process (useful for testing).
-    --delete-duplicates  Remove source file if binary match exists in target.
-    --help               Show this help message and exit.
+    --dry-run             Preview actions without moving any files.
+    --report              Generate a summary report of moved files.
+    --limit N             Limit number of files to process (useful for testing).
+    --delete-duplicates   Remove source file if binary match exists in target.
+    --handle-collisions   Rename files when filename collisions occur instead of skipping them.
+    --cleanup-empty-dirs  Remove empty directories from source paths after processing.
+    --help                Show this help message and exit.
 """
 
 import os
@@ -54,7 +63,8 @@ summary = {
     "moved": 0,
     "duplicates": 0,
     "locked": 0,
-    "errors": 0
+    "errors": 0,
+    "empty_dirs_removed": 0
 }
 
 def log(message):
@@ -350,6 +360,33 @@ def organize_file(filepath, dry_run=False, delete_duplicates=False, report=False
     if report:
         report_entries.append(f"{filename} → {target_dir}")
 
+# === CLEANUP FUNCTIONS ===
+
+def remove_empty_directories(root_dir, dry_run=False):
+    """Remove empty directories within root_dir, but not root_dir itself."""
+    removed_dirs = []
+    
+    # Walk the directory tree bottom-up to handle nested empty directories
+    for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
+        # Skip the root directory itself
+        if dirpath == root_dir:
+            continue
+            
+        try:
+            # Check if directory is empty (no files and no subdirectories)
+            if not filenames and not dirnames:
+                if dry_run:
+                    log(f"[DRY-RUN] Would remove empty directory: {dirpath}")
+                    removed_dirs.append(dirpath)
+                else:
+                    os.rmdir(dirpath)
+                    log(f"[CLEANUP] Removed empty directory: {dirpath}")
+                    removed_dirs.append(dirpath)
+        except Exception as e:
+            log(f"[ERROR] Failed to remove empty directory {dirpath}: {e}")
+    
+    return removed_dirs
+
 # === REPORTING FUNCTIONS ===
 
 def write_logs():
@@ -377,19 +414,27 @@ def write_report():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Organize NAS media by year based on metadata.",
-        epilog="Example: python organize_by_year.py --dry-run --report --limit 50 --delete-duplicates"
+        description="Media Organization Script v1.0 - Professional media organization with advanced features",
+        epilog="""Examples:
+  %(prog)s --dry-run --report                    # Preview what would be organized
+  %(prog)s --delete-duplicates --report          # Organize and remove duplicates
+  %(prog)s --handle-collisions --cleanup-empty-dirs --report  # Full organization with cleanup
+  %(prog)s --limit 100 --dry-run                # Test on first 100 files
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--dry-run", action="store_true", help="Preview actions without moving files.")
-    parser.add_argument("--report", action="store_true", help="Generate a summary report of moved files.")
-    parser.add_argument("--limit", type=int, default=None, help="Limit number of files to process (useful for testing).")
-    parser.add_argument("--delete-duplicates", action="store_true", help="Delete source file if binary duplicate exists in target.")
-    parser.add_argument("--handle-collisions", action="store_true", help="Rename files when filename collisions occur instead of skipping them.")
+    parser.add_argument("--dry-run", action="store_true", help="Preview actions without moving any files - safe for testing")
+    parser.add_argument("--report", action="store_true", help="Generate detailed summary report of all operations")
+    parser.add_argument("--limit", type=int, default=None, help="Limit number of files to process (useful for testing large collections)")
+    parser.add_argument("--delete-duplicates", action="store_true", help="Remove source files if binary duplicates exist in target location")
+    parser.add_argument("--handle-collisions", action="store_true", help="Auto-rename files when filename collisions occur (adds _copy1, _copy2, etc.)")
+    parser.add_argument("--cleanup-empty-dirs", action="store_true", help="Remove empty directories from source paths after successful organization")
     
     args = parser.parse_args()
     
     log("="*50)
-    log("NAS Media Organization Script v0.11")
+    log("Media Organization Script v1.0")
+    log("Professional Photo & Video Organization Tool")
     log("="*50)
     
     if args.dry_run:
@@ -424,6 +469,24 @@ def main():
         if args.limit and processed_count >= args.limit:
             break
     
+    # Clean up empty directories if requested
+    if args.cleanup_empty_dirs:
+        log("="*50)
+        log("CLEANING UP EMPTY DIRECTORIES")
+        log("="*50)
+        total_removed = 0
+        for upload_dir in UPLOAD_DIRS:
+            if os.path.exists(upload_dir):
+                log(f"[CLEANUP] Scanning for empty directories in: {upload_dir}")
+                removed_dirs = remove_empty_directories(upload_dir, args.dry_run)
+                total_removed += len(removed_dirs)
+        
+        summary["empty_dirs_removed"] = total_removed
+        if total_removed > 0:
+            log(f"[CLEANUP] Removed {total_removed} empty directories")
+        else:
+            log("[CLEANUP] No empty directories found")
+    
     # Write logs and report
     write_logs()
     if args.report:
@@ -438,6 +501,8 @@ def main():
     log(f"Files moved: {summary['moved']}")
     log(f"Duplicates handled: {summary['duplicates']}")
     log(f"Files locked/skipped: {summary['locked']}")
+    if args.cleanup_empty_dirs:
+        log(f"Empty dirs removed: {summary['empty_dirs_removed']}")
     log(f"Errors: {summary['errors']}")
 
 if __name__ == "__main__":

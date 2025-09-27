@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
 """
 organize_by_year_nas.py
-Simplified NAS version - uses only built-in Python libraries
-Works with file modification dates instead of EXIF data
+Version 1.0 - NAS-Optimized Media Organization Tool
+
+A dependency-free media organization solution designed specifically for NAS environments.
+Built for autonomous operation with zero external dependencies.
+
+Features:
+- Uses only built-in Python libraries (no external dependencies)
+- Works with file modification dates for reliable dating
+- Synology system file detection and cleanup
+- Fast duplicate detection using size + modification time
+- Comprehensive empty directory cleanup
+- Detailed logging and reporting
+- Perfect for scheduled automation
+
+Designed for Synology NAS and other Linux-based storage systems.
 """
 
 import os
@@ -348,20 +361,27 @@ def write_report():
 # === MAIN FUNCTION ===
 def main():
     parser = argparse.ArgumentParser(
-        description="Organize NAS media by year (simplified version using file dates).",
-        epilog="Example: python3 organize_by_year_nas.py --dry-run --report --limit 50"
+        description="NAS Media Organization Script v1.0 - Autonomous media organization for NAS systems",
+        epilog="""Examples:
+  %(prog)s --dry-run --report                    # Preview organization
+  %(prog)s --delete-duplicates --cleanup-empty-dirs --report  # Full automation
+  %(prog)s --limit 50 --dry-run                 # Test on 50 files
+  %(prog)s --report                             # Organize new uploads
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--dry-run", action="store_true", help="Preview actions without moving files.")
-    parser.add_argument("--report", action="store_true", help="Generate a summary report of moved files.")
-    parser.add_argument("--limit", type=int, default=None, help="Limit number of files to process.")
-    parser.add_argument("--delete-duplicates", action="store_true", help="Delete source file if duplicate exists.")
-    parser.add_argument("--handle-collisions", action="store_true", help="Rename files when filename collisions occur.")
-    parser.add_argument("--cleanup-empty-dirs", action="store_true", help="Remove empty directories after processing.")
+    parser.add_argument("--dry-run", action="store_true", help="Preview actions without moving any files - safe for testing")
+    parser.add_argument("--report", action="store_true", help="Generate detailed summary report with timestamps and statistics")
+    parser.add_argument("--limit", type=int, default=None, help="Limit number of files to process (excludes system files from count)")
+    parser.add_argument("--delete-duplicates", action="store_true", help="Remove source files if duplicates exist (uses size + mtime comparison)")
+    parser.add_argument("--handle-collisions", action="store_true", help="Auto-rename files when filename collisions occur (adds _copy1, _copy2, etc.)")
+    parser.add_argument("--cleanup-empty-dirs", action="store_true", help="Remove empty directories and system file artifacts after processing")
     
     args = parser.parse_args()
     
     log("="*50)
-    log("NAS Media Organization Script v0.12-NAS")
+    log("NAS Media Organization Script v1.0")
+    log("Autonomous Media Organization for NAS Systems")
     log("="*50)
     
     if args.dry_run:

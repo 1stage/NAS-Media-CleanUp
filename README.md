@@ -1,6 +1,6 @@
-# NAS Media CleanUp
+# NAS Media Organization v1.0
 
-A Python utility for organizing photos and videos from NAS upload directories into year-based folders based on their metadata creation date.
+Professional-grade media organization tools for automatic photo and video management. Designed for both Windows and NAS environments with enterprise-level reliability and features.
 
 ## Overview
 

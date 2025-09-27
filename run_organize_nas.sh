@@ -1,6 +1,6 @@
 #!/bin/bash
-# NAS Media Organization - Auto-updating Runner Script
-# This script ensures the latest version is always used
+# NAS Media Organization v1.0 - Auto-updating Runner Script
+# Ensures the latest version is always used for scheduled runs
 
 LOG_FILE="/volume1/share/sph/NAS-Media-CleanUp/logs/auto_run_$(date +%Y-%m-%d_%H-%M-%S).log"
 
